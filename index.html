@@ -1,0 +1,125 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bomblab 훈련소</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Black+Han+Sans&family=JetBrains+Mono:wght@400;700&family=Nanum+Gothic+Coding:wght@400;700&family=Noto+Sans+KR:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="style.css">
+
+<div id="app" data-skin="lab">
+  <!-- 시작 화면 (이야기 카드) -->
+  <section id="select" class="select">
+    <header class="select-head">
+      <p class="eyebrow">CS:APP Bomblab 사전 훈련 · 맛보기 빌드 2</p>
+      <h1>Bomblab 훈련소</h1>
+      <p class="lede">장소를 돌아다니며 단서를 모으고, 장면 속 컴퓨터를 켜서 진짜 gdb 명령으로 폭탄을 푸세요. gdb나 레지스터를 몰라도 괜찮습니다. <b>폭탄 해체반</b>은 아무것도 모르는 상태에서 시작해 15~20분 안에 Bomblab phase_1을 풀 수 있게 가르쳐 줍니다.</p>
+    </header>
+    <div id="theme-cards" class="theme-cards"></div>
+    <p class="foot">다루는 개념: 레지스터 · mov/lea · 호출 규약 · test/je · gdb의 break, run, si, disas, x/s, i r</p>
+  </section>
+
+  <!-- 게임 -->
+  <section id="game" class="game" hidden>
+    <header class="hud">
+      <button id="btn-back" class="btn-ghost" type="button">← 처음 화면</button>
+      <div class="hud-title">
+        <span id="hud-kicker" class="kicker"></span>
+        <strong id="hud-name"></strong>
+      </div>
+      <ol id="stage-list" class="stage-list"></ol>
+      <div class="hud-right">
+        <button id="btn-decoder" class="btn-ghost" type="button" hidden>해독기</button>
+        <button id="btn-clues" class="btn-ghost" type="button">수첩</button>
+        <button id="btn-cards" class="btn-ghost" type="button">카드</button>
+        <div class="stat"><span id="score-label">점수</span><b id="score">1000</b></div>
+      </div>
+    </header>
+
+    <main class="stage-wrap">
+      <div id="scene" class="scene">
+        <canvas id="scene-canvas" aria-hidden="true"></canvas>
+        <div id="spots" class="spots"></div>
+        <div id="place" class="place-tag"></div>
+        <div id="objective" class="objective" hidden></div>
+        <div id="title-card" class="title-card" hidden><span id="title-card-text"></span></div>
+      </div>
+      <div id="dialog" class="dialog" role="button" tabindex="0" aria-live="polite">
+        <canvas id="dlg-portrait" class="portrait" aria-hidden="true"></canvas>
+        <div class="dlg-body">
+          <p id="dlg-name" class="dlg-name"></p>
+          <p id="dlg-text" class="dlg-text"></p>
+          <div id="dlg-choices" class="choices"></div>
+        </div>
+        <span id="dlg-next" class="dlg-next" aria-hidden="true">▼</span>
+      </div>
+    </main>
+  </section>
+
+  <!-- 장면 속 컴퓨터 -->
+  <div id="monitor" class="monitor" hidden>
+    <div class="monitor-frame" role="dialog" aria-modal="true" aria-label="gdb 터미널">
+      <div class="mon-top">
+        <canvas id="mon-portrait" class="portrait sm" aria-hidden="true"></canvas>
+        <div class="mon-say">
+          <p id="mon-name" class="dlg-name"></p>
+          <p id="mon-line" class="mon-line"></p>
+          <div id="mon-choices" class="choices"></div>
+        </div>
+        <div class="mon-actions">
+          <div id="timer-box" class="stat" hidden><span>남은 시간</span><b id="timer">10:00</b></div>
+          <button id="mon-hint" class="btn-ghost" type="button">힌트 (감점)</button>
+          <button id="mon-close" class="btn-ghost" type="button">장면으로 ✕</button>
+        </div>
+      </div>
+      <div id="mon-board" class="mon-board">
+        <aside class="brief">
+          <div class="goal">
+            <h3 id="mon-goal-title">목표</h3>
+            <p id="mon-goal"></p>
+          </div>
+          <div id="mon-chips-box" class="chips-box">
+            <h3>추천 명령 <small>(누르거나 Tab)</small></h3>
+            <div id="mon-chips" class="chips"></div>
+          </div>
+          <div id="mon-tools-box" class="tools-box" hidden>
+            <h3>도구함</h3>
+            <ul id="mon-tools" class="tools"></ul>
+          </div>
+        </aside>
+        <section class="terminal">
+          <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>student@bomblab: ~/bomb — gdb ./bomb</div>
+          <div id="term-out" class="term-out" role="log" aria-live="polite"></div>
+          <form id="term-form" class="term-form" autocomplete="off">
+            <label id="prompt" for="term-in">(gdb)</label>
+            <input id="term-in" type="text" spellcheck="false" autocapitalize="off" autocorrect="off" enterkeyhint="send">
+          </form>
+        </section>
+        <aside id="mon-inspect" class="inspect">
+          <div id="regs-box" class="regs-box">
+            <h3>레지스터</h3>
+            <table id="regs" class="regs"></table>
+            <div id="flags" class="flags"></div>
+          </div>
+          <div id="code-box" class="code-box">
+            <h3 id="code-title">디스어셈블리</h3>
+            <pre id="code" class="code"></pre>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <p id="modal-kicker" class="modal-kicker"></p>
+      <h2 id="modal-title"></h2>
+      <p id="modal-story" class="modal-story"></p>
+      <div id="modal-body" class="modal-body"></div>
+      <div id="modal-actions" class="modal-actions"></div>
+    </div>
+  </div>
+  <div id="gloss" class="gloss" role="tooltip" hidden><b id="gloss-term"></b><p id="gloss-def"></p></div>
+  <div id="fx" class="fx" aria-hidden="true"></div>
+</div>
+
+<script type="module" src="game.js"></script>

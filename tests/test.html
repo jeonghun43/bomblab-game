@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Bomblab engine tests</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, monospace; background: #111; color: #ddd; padding: 16px; }
+  .pass { color: #6c6; } .fail { color: #f66; } pre { white-space: pre-wrap; color: #999; }
+</style>
+</head>
+<body>
+<h1 id="summary">running…</h1>
+<div id="log"></div>
+<script type="module">
+import { assemble, CPU } from '../engine/cpu.js';
+import { Gdb } from '../engine/gdb.js';
+import { LEVELS, getLevel } from '../levels.js';
+import { checkUntil, canonical, TOOLS } from '../terminal.js';
+import { PHASE1, lineText, decodePercent, CONCEPT_NAMES, NOTE_KEYS } from '../decoder.js';
+
+const results = [];
+const log = document.getElementById('log');
+function test(name, fn) {
+  try { fn(); results.push({ name, ok: true }); }
+  catch (e) { results.push({ name, ok: false, err: e.message }); }
+}
+function eq(a, b, msg = '') {
+  if (a !== b) throw new Error(`${msg} expected ${String(b)} got ${String(a)}`);
+}
+function runProg(src, rodata = {}) {
+  const cpu = new CPU(assemble(src, rodata));
+  let r;
+  do { r = cpu.step(); } while (r.status === 'ok');
+  return { cpu, r };
+}
+
+// ---- T007: instruction unit tests ----
+test('mov imm / 32-bit write zero-extends', () => {
+  const { cpu } = runProg('main:\n mov $-1,%rax\n mov $0x5,%eax\n ret');
+  eq(cpu.regs.rax, 5n);
+});
+test('lea scale', () => {
+  const { cpu } = runProg('main:\n mov $0x4,%ecx\n lea 0x3(%rcx,%rcx,4),%eax\n ret');
+  eq(cpu.regs.rax, 23n);
+});
+test('add/sub', () => {
+  const { cpu } = runProg('main:\n mov $0xa,%eax\n add $0x5,%eax\n sub $0x14,%eax\n ret');
+  eq(BigInt.asIntN(32, cpu.regs.rax), -5n);
+});
+test('cmp + jg (signed) not taken for -1 > 1', () => {
+  const { cpu } = runProg('main:\n mov $-1,%eax\n mov $0x0,%ebx\n cmp $0x1,%eax\n jg .L1\n mov $0x7,%ebx\n.L1:\n ret');
+  eq(cpu.regs.rbx, 7n);
+});
+test('cmp + ja (unsigned) taken for -1 > 1', () => {
+  const { cpu } = runProg('main:\n mov $-1,%eax\n mov $0x0,%ebx\n cmp $0x1,%eax\n ja .L1\n mov $0x7,%ebx\n.L1:\n ret');
+  eq(cpu.regs.rbx, 0n);
+});
+test('push/pop and memory store', () => {
+  const { cpu } = runProg('main:\n mov $0x2a,%eax\n push %rax\n movl $0x3,(%rsp)\n pop %rbx\n ret');
+  eq(cpu.regs.rbx, 3n);
+});
+test('call/ret returns and exits normally', () => {
+  const { r, cpu } = runProg('main:\n call f\n add $0x1,%eax\n ret\nf:\n mov $0x9,%eax\n ret');
+  eq(r.status, 'exit'); eq(cpu.regs.rax, 10n);
+});
+test('bad memory → segv', () => {
+  const { r } = runProg('main:\n mov $0x0,%eax\n mov (%rax),%ebx\n ret');
+  eq(r.status, 'segv');
+});
+
+// ---- T010: level tests ----
+function playLevelInput(level, input) {
+  const cpu = new CPU(assemble(level.asm, level.rodata));
+  const events = [];
+  for (;;) {
+    const r = cpu.step();
+    if (r.event) events.push(r.event);
+    if (r.status === 'needInput') { cpu.provideInput(input); continue; }
+    if (r.status !== 'ok') return { status: r.status, events };
+  }
+}
+const L1 = getLevel(1), LC = getLevel('calc');
+test('only the puzzles the tutorial uses', () => eq(LEVELS.map((l) => l.id).join(), '1,calc'));
+test('L1: correct string → defused + exit', () => {
+  const r = playLevelInput(L1, L1.answer);
+  eq(r.status, 'exit'); eq(r.events.includes('defused'), true);
+});
+test('L1: wrong string → exploded', () => eq(playLevelInput(L1, 'hello').status, 'exploded'));
+test('L1: empty string → exploded', () => eq(playLevelInput(L1, '').status, 'exploded'));
+test('L1: decoy string → exploded', () => eq(playLevelInput(L1, L1.rodata[0x402440]).status, 'exploded'));
+
+// ---- T013: gdb scenario tests ----
+function session(level) {
+  const g = new Gdb(assemble(level.asm, level.rodata), level);
+  const all = [];
+  const run = (cmd) => { const r = g.exec(cmd); all.push(`(gdb) ${cmd}\n${r.out}`); return r; };
+  return { g, run, transcript: () => all.join('\n') };
+}
+let transcript1 = '';
+test('gdb: L1 solved with break/run/disas/x/s', () => {
+  const s = session(L1);
+  eq(s.run('break phase_1').out, 'Breakpoint 1 at 0x400dc0');
+  let r = s.run('run');
+  eq(r.events.includes('input'), true, 'waits for input');
+  r = s.run('anything');
+  eq(r.events.includes('break'), true, 'hits breakpoint');
+  r = s.run('disas');
+  if (!r.out.includes('mov    $0x402400,%esi')) throw new Error('disas missing mov: ' + r.out);
+  if (!r.out.includes('=> 0x0000000000400dc0 <+0>:')) throw new Error('disas missing cursor');
+  r = s.run('x/s 0x402400');
+  eq(r.out, `0x402400:\t"${L1.answer}"`);
+  r = s.run('i r rdi');
+  if (!r.out.startsWith('rdi            0x603780')) throw new Error(r.out);
+  r = s.run('p (char*)$rdi');
+  eq(r.out, '$1 = 0x603780 "anything"');
+  r = s.run('break explode_bomb');
+  r = s.run('c');
+  eq(r.events.includes('break'), true, 'caught by explode_bomb breakpoint');
+  r = s.run('run');
+  r = s.run(L1.answer);
+  eq(r.events.includes('break'), true);
+  s.run('delete');
+  r = s.run('c');
+  eq(r.events.includes('defused'), true); eq(r.events.includes('exited'), true);
+  transcript1 = s.transcript();
+});
+test('gdb: L1 run without break + wrong → exploded', () => {
+  const s = session(L1);
+  s.run('run');
+  eq(s.run('nope').events.includes('exploded'), true);
+});
+test('gdb: calc si + i r', () => {
+  const s = session(LC);
+  s.run('break calc'); s.run('run');
+  s.run('si 2');
+  const r = s.run('i r rax');
+  if (!r.out.startsWith('rax            0x8                8')) throw new Error(r.out);
+  s.run('ni'); s.run('ni');
+  eq(s.run('p $rdi').out, '$1 = 6');
+  eq(s.run('p/x $rax').out, '$2 = 0x8');
+});
+test('gdb: ni steps over call', () => {
+  const s = session(LC);
+  s.run('break main'); s.run('run'); s.run('si');
+  const r = s.run('ni');
+  if (!r.out.includes('in main ()')) throw new Error(r.out);
+});
+test('gdb: errors look like gdb', () => {
+  const s = session(LC);
+  eq(s.run('si').out, 'The program is not being run.');
+  eq(s.run('foo').out, 'Undefined command: "foo".  Try "help".');
+  eq(s.run('break nope').out, 'Function "nope" not defined.');
+  eq(s.run('i r').out, 'The program has no registers now.');
+});
+
+// ---- 002 T015: story script validation ----
+const { STORIES } = await import('../story.js');
+const { SCENES, PORTRAITS } = await import('../art.js');
+test('portraits are 16x16', () => {
+  for (const [id, p] of Object.entries(PORTRAITS)) {
+    eq(p.rows.length, 16, id + ' rows');
+    p.rows.forEach((r, i) => eq(r.length, 16, `${id} row ${i}`));
+  }
+});
+for (const s of Object.values(STORIES)) {
+  test(`story ${s.id}: references are valid`, () => {
+    for (const c of Object.values(s.chars)) if (c.sprite && !PORTRAITS[c.sprite]) throw new Error('missing sprite ' + c.sprite);
+    if (!s.chars[s.guide]) throw new Error('missing guide');
+    if (!SCENES[s.cover]) throw new Error('missing cover');
+    let scene = null;
+    const looked = new Set();
+    const levelsUsed = new Set();
+    for (const step of s.script) {
+      if (step.scene) { if (!SCENES[step.scene]) throw new Error('missing scene ' + step.scene); scene = step.scene; }
+      if ('say' in step && step.say && !s.chars[step.say]) throw new Error('unknown speaker ' + step.say);
+      if (step.quiz && !(step.quiz.answer < step.quiz.options.length)) throw new Error('bad quiz');
+      if (step.investigate) {
+        const ends = step.investigate.spots.filter((sp) => sp.kind !== 'look' || sp.ends);
+        if (!ends.length) throw new Error('investigation cannot end');
+        for (const sp of step.investigate.spots) {
+          if (!SCENES[scene].spots[sp.at]) throw new Error(`spot ${sp.at} not in scene ${scene}`);
+          if (sp.kind === 'look') looked.add(sp.id || sp.at);
+          if (sp.kind === 'terminal') { if (!getLevel(sp.level)) throw new Error('bad level ' + sp.level); levelsUsed.add(sp.level); }
+          for (const r of sp.requires || []) if (!step.investigate.spots.some((x) => (x.id || x.at) === r && x.kind === 'look')) throw new Error(`requires ${r} not lookable here`);
+          if (sp.requires && !sp.locked) throw new Error(`spot ${sp.at} needs locked lines`);
+          if (sp.lesson) {
+            for (const t of sp.lesson.tasks) {
+              for (const u of t.unlock || []) if (!TOOLS[u]) throw new Error('unknown tool ' + u);
+              if (!t.until && !t.predict && !t.ack) throw new Error(`lesson ${sp.lesson.id}: task without until/predict/ack`);
+              if (t.predict && !(t.predict.answer < t.predict.options.length)) throw new Error('bad predict');
+            }
+          }
+        }
+      }
+    }
+    eq([...levelsUsed].sort().join(), [...s.levels].sort().join(), 'story.levels matches levels used');
+    eq(s.script.at(-1).ending, true, 'ends with ending');
+  });
+}
+
+// ---- 003 T013: tutorial ----
+test('calc level: rdi ends at 6', () => {
+  const Lc = getLevel('calc');
+  const cpu = new CPU(assemble(Lc.asm));
+  let r; do { r = cpu.step(); } while (r.status === 'ok');
+  eq(cpu.regs.rdi, 6n); eq(Lc.check('6'), true); eq(Lc.check('8'), false);
+});
+test('checkUntil basics', () => {
+  const g = new Gdb(assemble(getLevel('calc').asm), getLevel('calc'));
+  eq(checkUntil({ event: 'break' }, { events: [], gdb: g }), false);
+  g.exec('break calc'); const r = g.exec('run');
+  eq(checkUntil({ event: 'break', at: 'calc' }, { events: r.events, gdb: g }), true);
+  eq(checkUntil({ event: 'break', at: 'main' }, { events: r.events, gdb: g }), false);
+  g.exec('si');
+  eq(checkUntil({ reg: 'rax', eq: 5 }, { gdb: g }), true);
+  eq(checkUntil({ cmd: '^(p|print)\\s+\\$rdi$' }, { line: 'p $rdi', gdb: g }), true);
+  eq(checkUntil({ cmd: '^x/s', out: 'Registers' }, { line: 'x/s 0', out: 'Cannot access', gdb: g }), false);
+  eq(checkUntil({ answer: true }, { gdb: g, answered: true }), true);
+});
+test('canonical command names', () => {
+  eq(canonical('si 3'), 'stepi'); eq(canonical('x/s 0x1'), 'x'); eq(canonical('b phase_1'), 'break'); eq(canonical('disas'), 'disassemble');
+});
+
+// Model answers for each tutorial task: array of commands, or null for predict/ack.
+const MODEL = {
+  hook: [['run'], ['abc'], null],
+  stop: [['break phase_1'], ['run'], ['abc'], null, ['continue'], null],
+  calc: [['break calc', 'run'], null, ['si'], null, null, ['si'], null, ['si'], ['si'], ['p $rdi'], ['answer 6']],
+  memory: [['x/s 0x402440'], null, ['run', 'abc'], ['p $rdi'], null, ['x/s $rdi'], null],
+  final: [['break phase_1', 'run', 'abc', 'disas'], null, ['x/s 0x402400'], null, ['run', L1.answer, 'c']],
+};
+{
+  const story = STORIES.defuse;
+  const sessionsSim = new Map();
+  const lessons = story.script.filter((s) => s.investigate).flatMap((s) => s.investigate.spots).filter((sp) => sp.lesson);
+  test('tutorial: every lesson has a model answer', () => eq(lessons.map((l) => l.lesson.id).join(), Object.keys(MODEL).join()));
+  for (const sp of lessons) {
+    test(`tutorial lesson ${sp.lesson.id}: model answers satisfy every task`, () => {
+      const key = sp.lesson.session;
+      if (!sessionsSim.has(key)) sessionsSim.set(key, new Gdb(assemble(getLevel(sp.level).asm, getLevel(sp.level).rodata), getLevel(sp.level)));
+      const g = sessionsSim.get(key);
+      const steps = MODEL[sp.lesson.id];
+      eq(steps.length, sp.lesson.tasks.length, 'model length');
+      sp.lesson.tasks.forEach((task, i) => {
+        if (!task.until) { if (steps[i] !== null) throw new Error(`task ${i} expects null`); return; }
+        let ok = false;
+        for (const line of steps[i]) {
+          let r = { out: '', events: [] }, answered = false;
+          if (line.startsWith('answer ')) answered = getLevel(sp.level).check(line.slice(7));
+          else r = g.exec(line);
+          if (checkUntil(task.until, { line, out: r.out, events: r.events, gdb: g, answered })) ok = true;
+        }
+        if (!ok) throw new Error(`task ${i} (${task.goal || ''}) not satisfied`);
+      });
+    });
+  }
+}
+
+// ---- 003 T021: script markdown parser ----
+const { parseScript, parseUntil } = await import('../scriptmd.js');
+test('md parser: until conditions', () => {
+  const u = parseUntil('event=break at=phase_1 cmd=`^x/s\\s+0x1$` running reg=rax eq=5');
+  eq(u.event, 'break'); eq(u.at, 'phase_1'); eq(u.cmd, '^x/s\\s+0x1$'); eq(u.running, true); eq(u.eq, 5);
+});
+test('md parser: small script', () => {
+  const s = parseScript(`# t
+## 메모
+반장: 이 줄은 메모 섹션이라 무시된다
+## 설정
+- id: t
+- 레벨: calc, 1
+- 힌트머리: 무전:
+## 캐릭터
+- chief: 반장 (초상화 chief)
+## 대본
+### 장면: van
+> 주석은 무시
+반장: 첫 대사
+내레이션: 둘째: 콜론이 있어도 됨
+### 조사: 조사하자
+#### 살펴보기 note@map: 쪽지
+단서: 제목 | 내용
+반장: 쪽지다
+#### 컴퓨터 laptop: 노트북
+레벨: calc
+필요: note
+잠김:
+반장: 쪽지부터
+레슨: L
+##### 과제
+도구: run
+반장: 쳐 봐
+완료: event=input
+##### 예측
+질문: 몇?
+보기: 1 | *2
+정답: 응
+오답: 아냐
+해제 후:
+반장: 끝
+### 대사
+반장: 조사 뒤 대사
+### 퀴즈
+화자: 반장
+질문: q
+보기: *a | b
+정답: r
+오답: w
+반장: 퀴즈 뒤 대사
+### 엔딩
+`);
+  eq(s.hintLead, '무전: ');
+  eq(s.levels.join(), 'calc,1');
+  eq(s.script.length, 8);
+  eq(s.script[2].text, '둘째: 콜론이 있어도 됨');
+  eq(s.script[2].say, null);
+  const [note, pc] = s.script[3].investigate.spots;
+  eq(note.id, 'note'); eq(note.at, 'map'); eq(note.clue.text, '내용');
+  eq(pc.requires.join(), 'note'); eq(pc.locked[0].text, '쪽지부터'); eq(pc.after[0].text, '끝');
+  eq(pc.lesson.tasks.length, 2); eq(pc.lesson.tasks[1].predict.answer, 1);
+  eq(s.script[4].text, '조사 뒤 대사');
+  eq(s.script[5].quiz.answer, 0);
+  eq(s.script[6].text, '퀴즈 뒤 대사');
+});
+test('md parser: rejects unknown keys', () => {
+  let threw = false;
+  try { parseScript('## 캐릭터\n- a: A\n## 대본\n### 이상한단계\n'); } catch { threw = true; }
+  eq(threw, true);
+});
+// ---- 004: 반장 말투 ----
+function tutorialTexts(s) {
+  const out = [];
+  const push = (where, t) => { if (t) out.push([where, t]); };
+  push('소개', s.tagline); push('오답', s.wrongAnswer); push('잠긴도구', s.lockedTool);
+  s.explode.forEach((t) => push('폭발', t));
+  for (const [k, v] of Object.entries(s.glossary || {})) push('용어 ' + k, v);
+  for (const [k, v] of Object.entries(s.decoderNotes || {})) push('해독기 ' + k, v);
+  for (const st of s.script) {
+    if ('say' in st) push('대사', st.text);
+    if (st.line) push('해독기 설명', st.line);
+    if (st.quiz) ['question', 'right', 'wrong'].forEach((k) => push('퀴즈', st.quiz[k]));
+    for (const sp of st.investigate?.spots || []) {
+      [...(sp.lines || []), ...(sp.locked || []), ...(sp.after || [])].forEach((l) => push('사물 ' + sp.at, l.text));
+      if (sp.clue) push('단서', sp.clue.text);
+      for (const t of sp.lesson?.tasks || []) {
+        ['say', 'goal', 'hint'].forEach((k) => push(`과제 ${sp.lesson.id}.${k}`, t[k]));
+        if (t.predict) ['q', 'right', 'wrong'].forEach((k) => push(`예측 ${sp.lesson.id}`, t.predict[k]));
+      }
+    }
+  }
+  return out;
+}
+test('반장 말투: "~다."로 끝나는 문장이 없다 (따옴표 안 제외)', () => {
+  const bad = [];
+  for (const [where, text] of tutorialTexts(STORIES.defuse)) {
+    const noQuotes = text.replace(/"[^"]*"/g, '""');
+    for (const sentence of noQuotes.split(/(?<=[.!?…])\s+/)) {
+      if (/다[.!]?$/.test(sentence.trim())) bad.push(`${where}: ${sentence.trim()}`);
+    }
+  }
+  if (bad.length) throw new Error(bad.slice(0, 5).join(' / '));
+});
+test('모든 [[용어]]에 풀이가 있다', () => {
+  const missing = new Set();
+  for (const [, text] of tutorialTexts(STORIES.defuse)) {
+    for (const m of text.matchAll(/\[\[(.+?)\]\]/g)) if (!STORIES.defuse.glossary[m[1]]) missing.add(m[1]);
+  }
+  eq([...missing].join(), '');
+});
+test('해독기 설명 키가 모두 있다', () => {
+  eq(NOTE_KEYS.filter((k) => !STORIES.defuse.decoderNotes[k]).join(), '');
+});
+
+// ---- 005: 퍼즐 글은 scripts/puzzles.md ----
+const { parsePuzzles, inlineMd } = await import('../scriptmd.js');
+test('inlineMd: code, bold, escaping', () => {
+  eq(inlineMd('`answer <값>`으로 **꼭** 제출'), '<code>answer &lt;값&gt;</code>으로 <b>꼭</b> 제출');
+  eq(inlineMd('`a*b` AT&T'), '<code>a*b</code> AT&amp;T');
+});
+test('parsePuzzles: tools and a level', () => {
+  const p = parsePuzzles('## 도구함\n- run: run | 실행\n## 퍼즐: 7\n제목: T\n목표: `x`\n추천 명령: a, b c\n힌트: h1\n힌트: h2\n### 카드: C: 제목\n- **굵게** 하나\n- 둘\n## 메모\n- 무시: 됨');
+  eq(p.tools.run.join('|'), 'run|실행');
+  const lv = p.levels[7];
+  eq(lv.title, 'T'); eq(lv.goal, '<code>x</code>'); eq(lv.walkthrough.join('|'), 'a|b c');
+  eq(lv.hints.length, 2); eq(lv.card.title, 'C: 제목'); eq(lv.card.body, '<ul><li><b>굵게</b> 하나</li><li>둘</li></ul>');
+});
+test('every level got its text from puzzles.md', () => {
+  for (const lv of LEVELS) {
+    for (const k of ['title', 'goal']) if (!lv[k]) throw new Error(`${lv.id}.${k} 없음`);
+    if (!lv.hints.length || !lv.walkthrough.length || !lv.card.body.includes('<li>')) throw new Error(`${lv.id} 글 누락`);
+  }
+  eq(Object.keys(TOOLS).join(), 'run,break,continue,stepi,print,info,x,disassemble');
+});
+test('every story has an ending text', () => {
+  for (const s of Object.values(STORIES)) if (!s.endingText) throw new Error(s.id + ' 엔딩문구 없음');
+});
+
+test('stories are loaded from scripts/*.md', () => {
+  eq(Object.keys(STORIES).join(), 'defuse');
+  eq(STORIES.defuse.tutorial, true);
+});
+
+// ---- decoder ----
+test('decoder text equals real disas phase_1', () => {
+  const g = new Gdb(assemble(L1.asm, L1.rodata), L1);
+  const lines = g.exec('disas phase_1').out.split('\n').slice(1, -1)
+    .map((l) => l.replace(/^(=> | {3})/, '').replace(/^0x0+([0-9a-f]+)/, '0x$1'));
+  eq(PHASE1.map(lineText).join('\n'), lines.join('\n'));
+});
+test('decoder percent: 0 → 100', () => {
+  if (decodePercent(new Set(['hook'])) >= 10) throw new Error('should start near 0');
+  eq(decodePercent(new Set(Object.keys(CONCEPT_NAMES))), 100);
+  const used = new Set(STORIES.defuse.script.filter((s) => s.decoder).flatMap((s) => s.decoder));
+  used.add('hook');
+  eq(decodePercent(used), 100, 'tutorial reaches 100%');
+});
+
+// ---- report ----
+const failed = results.filter((r) => !r.ok);
+document.getElementById('summary').textContent = failed.length ? `FAIL ${failed.length}/${results.length}` : `PASS ${results.length}/${results.length}`;
+document.getElementById('summary').className = failed.length ? 'fail' : 'pass';
+for (const r of results) {
+  const d = document.createElement('div');
+  d.className = r.ok ? 'pass' : 'fail';
+  d.textContent = (r.ok ? '✔ ' : '✘ ') + r.name + (r.err ? ' — ' + r.err : '');
+  log.appendChild(d);
+}
+const pre = document.createElement('pre');
+pre.textContent = transcript1;
+log.appendChild(pre);
+window.__results = results;
+</script>
+</body>
+</html>
